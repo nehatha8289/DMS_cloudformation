@@ -1,0 +1,226 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Parameters:
+  pSrcDbName:
+    Description: Source DB name
+    Type: String
+  pSrcDbEngine:
+    Description: Choose the source DB engine to stream changes.
+    Type: String
+  pDBServer:
+    Description: Hostname of the source DB.
+    Type: String
+  pDBPort:
+    Description: Port of the source DB.
+    Type: Number
+  pDBUser:
+    Description: Username for the source DB.
+    Type: String
+  pDBPassword:
+    Description: Password for the source DB.
+    Type: String
+    NoEcho: true
+  pDMSTableFilter:
+    Description: Choose the DMS table filter criteria.
+    Type: String
+    Default: "%"
+    AllowedPattern: ^[a-zA-Z0-9-_%]*$
+    ConstraintDescription: Must only contain upper/lower-case letters, numbers, -, _, or %.
+  pDMSSchemaFilter:
+    Description: Choose the DMS schema filter criteria.
+    Type: String
+    Default: "%"
+  pCreateDMSBucket:
+    Description: Select Yes to create a new bucket and No to use an existing bucket
+    Type: String
+    Default: 'Yes'
+    AllowedValues:
+    - 'Yes'
+    - 'No'
+  pS3BucketTarget:
+    Description: Parameter to get the name of S3 target bucket
+    Type: String
+  pS3bucketTargetFolder:
+    Description: Parameter to get the name of S3 target bucket folder
+    Type: String
+  VpcSubnetA:
+    Description: Subnet-1 for Replication Instance with network path to source DB.
+    Type: AWS::EC2::Subnet::Id
+  VpcSubnetB:
+    Description: Subnet-2 for Replication Instance with network path to source DB.
+    Type: AWS::EC2::Subnet::Id
+  SecurityGroup:
+    Description: Sec Group for Replication Instance with rules to allow it to connect to your source DB.
+    Type: AWS::EC2::SecurityGroup::Id
+  pEnableMZ:
+    Description: Enable Multi-AZ for replication instance
+    Type: String
+    Default: false
+    AllowedValues:
+    - true
+    - false
+  pReplicationInstanceClass:
+    Description: The replication instance class
+    Type: String
+
+Conditions:
+  pCreateDMSBucket: !Equals
+    - !Ref pCreateDMSBucket
+    - 'Yes'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      -
+        Label:
+          default: "DMS Source Database Configuration"
+        Parameters:
+          - pSrcDbEngine
+          - pDBServer
+          - pDBPort
+          - pDBUser
+          - pDBPassword
+          - pSrcDbName
+      -
+        Label:
+          default: "DMS Task Configuration"
+        Parameters:
+          - pReplicationInstance
+          - pDMSTableFilter
+          - pDMSSchemaFilter
+          - pCreateDMSBucket
+          - pS3BucketTarget
+          - pS3BucketTargetFolder
+
+Resources:
+  rDMSReplicationSubnetGroup:
+    Type: AWS::DMS::ReplicationSubnetGroup
+    Properties:
+      ReplicationSubnetGroupDescription: Subnet group for replication instance
+      SubnetIds:
+        - !Ref VpcSubnetA
+        - !Ref VpcSubnetB
+
+  rDMSReplicationInstance:
+    Type: AWS::DMS::ReplicationInstance
+    Properties:
+      AllowMajorVersionUpgrade: false
+      AutoMinorVersionUpgrade: false
+      EngineVersion: "3.4.6"
+      MultiAZ: !Ref pEnableMZ
+      PubliclyAccessible: false
+      ReplicationInstanceClass: !Ref pReplicationInstanceClass
+      ReplicationSubnetGroupIdentifier: !Ref rDMSReplicationSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref SecurityGroup
+
+# You can restrict the policy by replacing all resources(*) with S3 bucket ARN, in case the target bucket already exists.
+  rExecutionRole:
+    Type: AWS::IAM::Role
+    Properties :
+      RoleName: dms_execution_role
+      AssumeRolePolicyDocument:
+        Version : 2012-10-17
+        Statement :
+          -
+            Effect : Allow
+            Principal :
+              Service :
+                - dms.amazonaws.com
+            Action :
+              - sts:AssumeRole
+      Path : /
+      Policies :
+        -
+          PolicyName: DMSExecutionPolicy
+          PolicyDocument :
+            Version: 2012-10-17
+            Statement:
+              -
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectTagging
+                  - s3:DeleteObject
+                Resource: "*"
+              -
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: "*"
+
+  DMSSourceEndpoint:
+    Type: AWS::DMS::Endpoint
+    Properties:
+      EndpointType: source
+      EngineName:
+        Ref: pSrcDbEngine
+      ServerName:
+        Ref: pDBServer
+      Port:
+        Ref: pDBPort
+      Username:
+        Ref: pDBUser
+      Password:
+        Ref: pDBPassword
+      DatabaseName:
+        Ref: pSrcDbName
+
+  DMSRawBucket:
+    Condition: pCreateDMSBucket
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName:
+        Ref: pS3BucketTarget
+
+  DMSS3EndpointTarget:
+    Type: AWS::DMS::Endpoint
+    Properties:
+      EndpointType: 'target'
+      EngineName: S3
+      #Format of data ingested into the bucket. Choose the format based on the requirement, default format is csv.
+      ExtraConnectionAttributes : "dataFormat=parquet"
+      S3Settings:
+        BucketFolder: !Ref pS3bucketTargetFolder
+        BucketName: !Ref pS3BucketTarget
+        ServiceAccessRoleArn: !GetAtt rExecutionRole.Arn
+
+# Create the type of replication task from the below and remove the ones that are not needed
+  DMSReplicationTaskFullLoad: 
+    Type: AWS::DMS::ReplicationTask
+    Properties: 
+      MigrationType: "full-load"
+      ReplicationInstanceArn: !Ref rDMSReplicationInstance
+      SourceEndpointArn: !Ref DMSSourceEndpoint
+      TargetEndpointArn: !Ref DMSS3EndpointTarget
+      TableMappings:
+        Fn::Sub:
+          - "{\"rules\": [{\"rule-type\": \"selection\", \"rule-id\": \"1\", \"rule-action\": \"include\", \"object-locator\": {\"schema-name\": \"${schema}\", \"table-name\": \"${tables}\"}, \"rule-name\": \"1\"}]}"
+          - {schema: !Ref pDMSSchemaFilter, tables: !Ref pDMSTableFilter }
+      ReplicationTaskSettings: "{\"Logging\": {\"EnableLogging\": true }}"
+
+  DMSReplicationTaskCDC: 
+    Type: AWS::DMS::ReplicationTask
+    Properties: 
+      MigrationType: "cdc"
+      ReplicationInstanceArn: !Ref rDMSReplicationInstance
+      SourceEndpointArn: !Ref DMSSourceEndpoint
+      TargetEndpointArn: !Ref DMSS3EndpointTarget
+      TableMappings:
+        Fn::Sub:
+          - "{\"rules\": [{\"rule-type\": \"selection\", \"rule-id\": \"1\", \"rule-action\": \"include\", \"object-locator\": {\"schema-name\": \"${schema}\", \"table-name\": \"${tables}\"}, \"rule-name\": \"1\"}]}"
+          - {schema: !Ref pDMSSchemaFilter, tables: !Ref pDMSTableFilter }
+      ReplicationTaskSettings: "{\"Logging\": {\"EnableLogging\": true }}"
+
+  DMSReplicationTaskFullandCDC: 
+    Type: AWS::DMS::ReplicationTask
+    Properties: 
+      MigrationType: "full-load-and-cdc"
+      ReplicationInstanceArn: !Ref rDMSReplicationInstance
+      SourceEndpointArn: !Ref DMSSourceEndpoint
+      TargetEndpointArn: !Ref DMSS3EndpointTarget
+      TableMappings:
+        Fn::Sub:
+          - "{\"rules\": [{\"rule-type\": \"selection\", \"rule-id\": \"1\", \"rule-action\": \"include\", \"object-locator\": {\"schema-name\": \"${schema}\", \"table-name\": \"${tables}\"}, \"rule-name\": \"1\"}]}"
+          - {schema: !Ref pDMSSchemaFilter, tables: !Ref pDMSTableFilter }
+      ReplicationTaskSettings: "{\"Logging\": {\"EnableLogging\": true }}"
